@@ -1,0 +1,12 @@
+---
+- name: install confd files
+  include_role:
+    name: confd-files-1.0.9
+
+- name: copy files
+  copy:
+    src: "{{ role_path }}/files/opt/app/"
+    dest: /opt/app/
+    owner: root
+    group: svc
+    mode: u=rw,g=r,o=

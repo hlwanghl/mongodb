@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+
+myPath="$0"
+
+cleanUp() {
+  local rc=$?
+  [ "$rc" -eq 0 ] || echo "# Failed ($rc)! Please check confd logs." >> $myPath
+  return $rc
+}
+
+trap cleanUp EXIT
+
+rotate() {
+  local path=$1 maxFilesCount=5
+  for i in $(seq 1 $maxFilesCount | tac); do
+    if [ -f "${path}.$i" ]; then mv ${path}.$i ${path}.$(($i+1)); fi
+  done
+  if [ -f "$path" ]; then cp $path ${path}.1; fi
+}
+
+flush() {
+  local targetFile=$1
+  if [ -n "$targetFile" ]; then
+    rotate $targetFile
+    cat > $targetFile -
+  else
+    cat -
+  fi
+}
+
+applyEnvs() {
+  local f; for f in $(find /opt/app/current/bin/envs/ -name appdev.env -o -name confd.env); do . $f; done
+}
+
+applyScripts() {
+  local f; for f in $(find /opt/app/current/bin/node/ -name confd.sh); do . $f; done
+}
+
+applyEnvs
+applyScripts
+
+set -eo pipefail
+if [ "$APPCTL_ENV" == "dev" ]; then set -x; fi
+
+{{- $superUser := "qc_master" }}
+{{- $superPass := getv "/cluster/app_id" | base64Encode }}
+{{- $rootUser := "root" }}
+{{- $rootPass := getv "/env/passwd" }}
+{{- $mongoPort := getv "/env/port" "27017" }}
+{{- $mongoKeyFile := "/data/mongodb/conf/key" }}
+{{- $mongoRsName := getv "/env/rsName" "foobar" }}
+{{- $allInstanceIds := lsdir "/hosts/replica" }}
+{{- $leavingInstanceIds := lsdir "/deleting-hosts/replica" }}
+{{- $joiningInstanceIds := lsdir "/adding-hosts/replica" }}
+
+allNodes="$(sort -V << ALL_NODES_EOF
+{{- range $allInstanceIds }}
+{{- if $joiningInstanceIds | filter . }}
+joining/{{ getv (printf "/adding-hosts/replica/%s/sid" .) }}/{{ getv (printf "/adding-hosts/replica/%s/node_id" .) }}/{{ getv (printf "/adding-hosts/replica/%s/ip" .) }}
+{{- else if $leavingInstanceIds | filter . }}
+leaving/{{ getv (printf "/deleting-hosts/replica/%s/sid" .) }}/{{ getv (printf "/deleting-hosts/replica/%s/node_id" .) }}/{{ getv (printf "/deleting-hosts/replica/%s/ip" .) }}
+{{- else }}
+stable/{{ getv (printf "/hosts/replica/%s/sid" .) }}/{{ getv (printf "/hosts/replica/%s/node_id" .) }}/{{ getv (printf "/hosts/replica/%s/ip" .) }}
+{{- end }}
+{{ end }}
+ALL_NODES_EOF
+)"
+
+flush /opt/app/current/bin/envs/node.env << NODE_ENV_EOF
+NODE_CTL=replica
+DATA_MOUNTS=/data
+MY_IP={{ getv "/host/ip" }}
+MY_SID={{ getv "/host/sid" }}
+GLOBAL_UUID={{ getv "/cluster/global_uuid" }}
+SERVICES="\$SERVICES mongod/true/tcp:{{ $mongoPort }}"
+MONGO_SU_NAME={{ $superUser }}
+MONGO_SU_PASS={{ $superPass }}
+MONGO_USER_ROOT="root"
+MONGO_USER_CUSTOM={{ getv "/env/user" }}
+MONGO_USER_PASSWD={{ getv "/env/passwd" }}
+MONGO_PORT={{ $mongoPort }}
+MONGO_KEY_FILE={{ $mongoKeyFile }}
+MONGO_RS_NAME={{ $mongoRsName }}
+STABLE_NODES=($(echo "$allNodes" | grep ^s | cut -d/ -f2-))
+JOINING_NODES=($(echo "$allNodes" | grep ^j | cut -d/ -f2-))
+LEAVING_NODES=($(echo "$allNodes" | grep ^l | cut -d/ -f2-))
+NODE_ENV_EOF
+
+flush /opt/app/current/conf/mongodb/mongod.conf << MONGOD_CONF_EOF
+systemLog:
+  destination: syslog
+  logAppend: true
+storage:
+  dbPath: /data/mongodb/data
+  engine: wiredTiger
+  journal:
+    enabled: true
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 0.25
+processManagement:
+   fork: true
+   pidFilePath: /var/run/mongodb/mongod.pid
+net:
+  bindIp: 0.0.0.0
+  port: 27017
+  maxIncomingConnections: 65536
+replication:
+  oplogSizeMB: 1024
+  replSetName: {{ $mongoRsName }}
+security:
+  authorization: enabled
+  keyFile: {{ $mongoKeyFile }}
+MONGOD_CONF_EOF
+
+reloadConfFile=/opt/app/current/conf/mongodb/reload.conf
+
+flush $reloadConfFile << RELOAD_CONF_EOF
+reloadRsHosts={{ getv "/env/port" }}
+RELOAD_CONF_EOF
+
+flush /opt/app/current/bin/envs/reload.env << RELOAD_CMD_EOF
+RELOAD_COMMANDS="$(diff --unchanged-line-format= --old-line-format= --new-line-format='%L' $reloadConfFile.1 $reloadConfFile | cut -d= -f1 | xargs)"
+RELOAD_CMD_EOF
+
